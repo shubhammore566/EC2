@@ -1,0 +1,118 @@
+name: Deploy to AWS EC2 (self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_port:
+        description: "Host port; leave blank to auto-select an available 850x port"
+        required: false
+        default: ""
+      image_tag:
+        description: "Docker image tag"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, x64, ec2-deployer]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Ensure Streamlit Dockerfile
+        shell: bash
+        run: |
+          if [ ! -f Dockerfile ]; then
+            if [ ! -f app.py ]; then
+              echo "No Dockerfile or app.py found. Add a Dockerfile or Streamlit app.py."
+              exit 1
+            fi
+            cat > Dockerfile <<'DOCKERFILE'
+          FROM python:3.12-slim
+          WORKDIR /app
+          COPY requirements.txt .
+          RUN pip install --no-cache-dir -r requirements.txt
+          COPY . .
+          EXPOSE 8501
+          CMD ["streamlit","run","app.py","--server.address=0.0.0.0","--server.port=8501","--server.headless=true"]
+          DOCKERFILE
+          fi
+
+      - name: Choose port and deploy container
+        shell: bash
+        env:
+          REQUESTED_PORT: ${{ inputs.app_port }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          slug="$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/-/g')"
+          container="agent-${slug}"
+          image="agent/${slug}:${IMAGE_TAG:-latest}"
+
+          if [ -n "${REQUESTED_PORT:-}" ]; then
+            port="$REQUESTED_PORT"
+          else
+            port=""
+            for candidate in $(seq 8501 8599); do
+              if ! docker ps --format '{{.Ports}}' | grep -Eq "(^|[,:])${candidate}->|:${candidate}-"; then
+                port="$candidate"
+                break
+              fi
+            done
+            [ -n "$port" ] || { echo "No free port in 8501-8599"; exit 1; }
+          fi
+
+          if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ]; then
+            echo "Invalid port: $port"; exit 1
+          fi
+
+          docker build -t "$image" .
+          docker rm -f "$container" >/dev/null 2>&1 || true
+          docker run -d --restart unless-stopped --name "$container" -p "${port}:8501" "$image"
+
+          sleep 3
+          if ! docker ps --format '{{.Names}}' | grep -qx "$container"; then
+            docker logs "$container" || true
+            exit 1
+          fi
+
+          token="$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)"
+          if [ -n "$token" ]; then
+            public_ip="$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/public-ipv4 || true)"
+            public_host="$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/public-hostname || true)"
+            instance_id="$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/instance-id || true)"
+          else
+            public_ip=""; public_host=""; instance_id=""
+          fi
+
+          host="${public_ip:-$public_host}"
+          [ -n "$host" ] || host="$(hostname -I | awk '{print $1}')"
+          url="http://${host}:${port}"
+
+          printf 'repository=%s\nbranch=%s\ninstance_id=%s\nhost=%s\nport=%s\ncontainer=%s\nimage=%s\nurl=%s\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$instance_id" "$host" "$port" "$container" "$image" "$url" > deployment-info.txt
+
+          {
+            echo "## 🚀 AWS EC2 deployment"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Repository | \`$GITHUB_REPOSITORY\` |"
+            echo "| Instance | \`$instance_id\` |"
+            echo "| Host | \`$host\` |"
+            echo "| Port | \`$port\` |"
+            echo "| Container | \`$container\` |"
+            echo "| Live URL | **$url** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deployment result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ec2-deployment-info
+          path: deployment-info.txt
+          retention-days: 3
